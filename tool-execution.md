@@ -4,7 +4,7 @@
 >
 > **What you know so far:** The agent loop keeps calling the LLM until it stops requesting "actions." The conversation grows each turn. The LLM has no memory — you re-send the entire message list every call.
 >
-> **What this layer solves:** HOW does the LLM request actions? What do they look like? How does the loop execute them? And how do results get back to the LLM?
+> **What this layer solves:** HOW does the LLM request actions? What do they look like in actual API calls? How does the loop know to execute them? And how do results get back to the LLM?
 
 ---
 
@@ -27,51 +27,58 @@ Without a way to act on the real world, the LLM can only say: "I don't have acce
 
 ---
 
-## The Solution: Tool Calling
+## The Core Principle: It's All Just Text
 
-Tool calling (also called "function calling") is a protocol — a structured agreement between the LLM and the agent loop. Here's the idea:
+Before diving into the mechanics, internalize this one idea:
+
+> **Tool calling is not magic. The LLM does not "call" anything. It outputs structured text. Your code reads that text and decides what to do with it.**
+
+Here is what actually happens:
 
 ```mermaid
 flowchart TD
-    subgraph PROTOCOL ["The Tool Calling Protocol"]
+    subgraph REALITY ["What Actually Happens"]
         direction TB
-        S1["1. TELL the LLM what tools exist<br/>(name, description, expected input schema)"]
-        S2["2. The LLM CHOOSES to call one<br/>(picks the tool name + fills in the input)"]
-        S3["3. The loop EXECUTES the tool<br/>(runs the actual TypeScript function)"]
-        S4["4. SEND the result back to the LLM<br/>(it uses the result to continue)"]
+        R1["1. You DESCRIBE tools as text<br/>(JSON definitions sent alongside the conversation)"]
+        R2["2. The LLM OUTPUTS structured text<br/>(a JSON block saying 'I want to use tool X with input Y')"]
+        R3["3. Your code PARSES that text<br/>(extracts the tool name and input from the JSON)"]
+        R4["4. Your code RUNS the real function<br/>(the only part that actually touches the real world)"]
+        R5["5. You CONVERT the result to text<br/>(and send it back as the next message)"]
 
-        S1 --> S2 --> S3 --> S4
+        R1 --> R2 --> R3 --> R4 --> R5
     end
 ```
 
-Let's walk through each step.
+The LLM never leaves its text world. It reads text descriptions of tools, then outputs text that follows a specific JSON format. **Your agent loop is the only thing that actually does anything.** The LLM is just choosing what to do next by writing structured text.
+
+This is the single most important concept in this layer. Everything below is the mechanical detail of how this text flows back and forth.
 
 ---
 
-### Step 1: Tell the LLM What Tools Exist
+## What the LLM Actually Sees: The Raw API Call
 
-When the loop calls the LLM, it sends a list of **tool definitions** alongside the conversation. A tool definition is a JSON object — it tells the LLM what a tool is called, what it does, and what input it expects. Here's what two definitions look like:
+Let's look at what the LLM **literally receives** when you call it with tools. This is the actual HTTP request body sent to the Anthropic API. No abstractions — the real thing.
+
+### Turn 1: You Ask a Question
+
+You send a `POST` request to `https://api.anthropic.com/v1/messages`:
 
 ```json
 {
+  "model": "claude-sonnet-4-20250514",
+  "max_tokens": 4096,
+  "system": "You are a helpful coding assistant working in the user's project.",
+
   "tools": [
     {
       "name": "read",
       "description": "Read the contents of a file. The file_path must be relative to the project directory.",
-      "inputSchema": {
+      "input_schema": {
         "type": "object",
         "properties": {
           "file_path": {
             "type": "string",
             "description": "Relative path to the file to read"
-          },
-          "offset": {
-            "type": "number",
-            "description": "Line number to start reading from (1-based). Optional."
-          },
-          "limit": {
-            "type": "number",
-            "description": "Number of lines to read. Optional."
           }
         },
         "required": ["file_path"]
@@ -79,8 +86,8 @@ When the loop calls the LLM, it sends a list of **tool definitions** alongside t
     },
     {
       "name": "bash",
-      "description": "Execute a shell command and return its output",
-      "inputSchema": {
+      "description": "Execute a shell command and return its output.",
+      "input_schema": {
         "type": "object",
         "properties": {
           "command": {
@@ -91,183 +98,698 @@ When the loop calls the LLM, it sends a list of **tool definitions** alongside t
         "required": ["command"]
       }
     }
+  ],
+
+  "messages": [
+    {
+      "role": "user",
+      "content": "What's in my package.json?"
+    }
   ]
 }
 ```
 
-**Reading the `inputSchema`:** The schema uses [JSON Schema](https://json-schema.org/) — a standard format for describing the shape of JSON objects. The key parts:
-- `"type": "object"` — the input is a JSON object (not a string or array)
-- `"properties"` — the fields that object can have, each with its own `type` and `description`
-- `"required": ["file_path"]` — the loop will pass these fields; the others (`offset`, `limit`) are optional
+Three things go in:
+1. **`system`** — the system prompt (instructions for the LLM)
+2. **`tools`** — the tool definitions (a JSON array describing what tools exist)
+3. **`messages`** — the conversation history (just one user message so far)
 
-The LLM reads the `description` fields to understand when to use the tool and what each parameter means. **The description matters a lot** — a vague description means the LLM picks the wrong tool. A precise one means it picks the right one and fills in the right values.
+The `tools` array is **literally text that the LLM reads**. It is not a "plugin system" or a "function registration API." It is structured text that tells the LLM: "Here are things you can ask me to do. If you want to use one, output a JSON block in this specific format."
 
-Each tool definition has exactly three fields:
+### Turn 1: The LLM Responds
 
-| Field | What It Is | Example |
-|-------|-----------|---------|
-| `name` | Unique identifier the LLM uses to call the tool | `"read"` |
-| `description` | What the tool does — the LLM reads this to decide whether to use it | `"Read the contents of a file..."` |
-| `inputSchema` | JSON Schema describing what input the tool expects | `{ type: "object", properties: {...}, required: [...] }` |
+The API returns:
 
----
-
-### Step 2: The LLM Chooses to Call a Tool
-
-Instead of responding with only text, the LLM can include one or more **tool calls** in its response. Each tool call has three fields:
-
-```
-LLM response:
-  - text: "Let me read your package.json"
-  - tool_use: {
-      id: "toolu_01ABC",
-      name: "read",
-      input: { "file_path": "package.json" }
+```json
+{
+  "id": "msg_01XFDUDYJgAACzvnptvVoYEL",
+  "type": "message",
+  "role": "assistant",
+  "content": [
+    {
+      "type": "text",
+      "text": "I'll read your package.json file."
+    },
+    {
+      "type": "tool_use",
+      "id": "toolu_01A09q90qw90lq917835lhds",
+      "name": "read",
+      "input": {
+        "file_path": "package.json"
+      }
     }
+  ],
+  "stop_reason": "tool_use"
+}
 ```
 
-The `id` field is generated by the LLM. It is a unique identifier for this specific tool call. Its purpose is to correlate the tool's result back to the right call — which becomes critical when the LLM makes multiple tool calls in the same response (explained in the section below). When you send the result back, you reference this same `id` so the LLM knows which call the result belongs to.
+Look at what the LLM did:
 
-The LLM chose `read` and filled in the path. It's like a function call — the LLM picked the function name and the arguments.
+1. It produced a `text` block — a plain English sentence.
+2. It produced a `tool_use` block — a structured JSON object with a tool name and input.
+3. It set `stop_reason` to `"tool_use"` — signaling "I want to use a tool before continuing."
+
+**The `tool_use` block is just text output.** The LLM did not "invoke" the `read` function. It wrote a JSON blob that says: "I'd like you to call `read` with `{ "file_path": "package.json" }` and tell me what you get back." Your loop reads this JSON, runs the actual function, and reports back.
+
+The `id` field (`"toolu_01A09q90qw90lq917835lhds"`) is generated by the LLM. It is a unique identifier for this specific tool call. When you send the result back, you attach this same `id` so the LLM knows which result matches which request. This matters when the LLM makes multiple tool calls in one response (covered below).
+
+### Turn 2: You Send the Tool Result Back
+
+Your loop ran the `read` function, got the file contents, and now sends the result back. Here is the **full request body** for the second API call:
+
+```json
+{
+  "model": "claude-sonnet-4-20250514",
+  "max_tokens": 4096,
+  "system": "You are a helpful coding assistant working in the user's project.",
+
+  "tools": [
+    { "name": "read", "description": "...", "input_schema": { "..." : "..." } },
+    { "name": "bash", "description": "...", "input_schema": { "..." : "..." } }
+  ],
+
+  "messages": [
+    {
+      "role": "user",
+      "content": "What's in my package.json?"
+    },
+    {
+      "role": "assistant",
+      "content": [
+        {
+          "type": "text",
+          "text": "I'll read your package.json file."
+        },
+        {
+          "type": "tool_use",
+          "id": "toolu_01A09q90qw90lq917835lhds",
+          "name": "read",
+          "input": { "file_path": "package.json" }
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "tool_result",
+          "tool_use_id": "toolu_01A09q90qw90lq917835lhds",
+          "content": "{\n  \"name\": \"my-app\",\n  \"version\": \"1.0.0\",\n  \"dependencies\": {\n    \"react\": \"^18.2.0\"\n  }\n}"
+        }
+      ]
+    }
+  ]
+}
+```
+
+Notice what happened to `messages`:
+
+1. **Message 1** (`user`): Your original question — unchanged.
+2. **Message 2** (`assistant`): The LLM's response from Turn 1 — replayed exactly as it came back. This includes both the text block and the `tool_use` block.
+3. **Message 3** (`user`): The tool result. This is new. Your loop created this message. The `tool_use_id` field matches the `id` from the tool call in message 2.
+
+**Why is the tool result in a `user` message?** The Anthropic API enforces strictly alternating roles: `user → assistant → user → assistant → ...`. The LLM's response was an `assistant` message. The next message must be `user`. Tool results are the user's "reply" — your loop is speaking on behalf of the user, saying: "Here's the result of that tool you asked for."
+
+You also resend the **full `tools` array** and the **full `system` prompt** every call. The LLM has no memory. Every API call is a fresh start — the LLM reconstructs its understanding from the entire payload you send.
+
+### Turn 2: The LLM Responds With the Final Answer
+
+```json
+{
+  "id": "msg_01YBGKjFdqkZ8rT1234abcd",
+  "type": "message",
+  "role": "assistant",
+  "content": [
+    {
+      "type": "text",
+      "text": "Your package.json contains a project called \"my-app\" at version 1.0.0. It has one dependency: React 18.2.0."
+    }
+  ],
+  "stop_reason": "end_turn"
+}
+```
+
+This time:
+- Only a `text` block, no `tool_use`.
+- `stop_reason` is `"end_turn"` — the LLM is done.
+
+The loop sees `"end_turn"`, stops looping, and returns the text to the user.
 
 ---
 
-### Step 3: The Loop Executes the Tool
+## How the LLM Knows How to Call Tools
 
-The agent loop receives the tool call, looks up the tool in the registry, and runs its `execute` function:
+This is the question everyone asks: "How does the LLM know to output that specific JSON format?"
+
+The answer has two parts.
+
+### Part 1: The API Provider Trains the Model
+
+The LLM was **fine-tuned** (trained on examples) to recognize tool definitions and produce `tool_use` blocks. When Anthropic (or OpenAI, or Google) adds tool-calling support, they train the model on thousands of examples like:
 
 ```
-execute("read", { file_path: "package.json" })
-  --> resolves path within project root
-  --> reads the actual file from disk
-  --> returns: { output: '{ "name": "my-app", "version": "1.0.0" }', isError: false }
+Given these tool definitions: [...]
+Given this user message: "What's in my package.json?"
+The correct output is: a tool_use block with name "read" and input { "file_path": "package.json" }
 ```
 
-This is where the real world gets involved. The loop is the bridge between the LLM's text world and your computer.
+The model learns the pattern: "When I see tool definitions and a user request that could be served by one of those tools, I should output a `tool_use` block with the right name and input."
+
+**You don't teach the model this format.** The API provider already did. Your job is to provide clear tool definitions so the model can make good decisions.
+
+### Part 2: Your Descriptions Guide the Decision
+
+The model decides **which** tool to call by reading the `name` and `description` fields. It decides **what input** to provide by reading the `input_schema` — specifically the `description` fields on each property.
+
+This is why descriptions matter enormously. Compare:
+
+```json
+{
+  "name": "do_thing",
+  "description": "Does a thing",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "x": { "type": "string", "description": "The input" }
+    }
+  }
+}
+```
+
+vs.
+
+```json
+{
+  "name": "read",
+  "description": "Read the contents of a file from disk. Returns the full file content as a string. The file_path must be relative to the project root directory.",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "file_path": {
+        "type": "string",
+        "description": "Relative path to the file to read, e.g. 'src/index.ts' or 'package.json'"
+      }
+    }
+  }
+}
+```
+
+The first one — the LLM has no idea when to use it or what `x` means. The second one — the LLM clearly knows this reads files and that `file_path` should be a relative path.
+
+**Tool definitions are natural-language instructions.** The JSON structure is for the API, but the `description` strings are for the LLM to read and reason about. Write them like you're explaining the tool to a competent colleague.
 
 ---
 
-### Step 4: Send the Result Back
+## Implementing the Agent Loop With Tool Calls
 
-The tool result is added to the conversation and the LLM is called again:
+Now let's build the loop. We'll start with pseudocode, then show real TypeScript.
+
+### Pseudocode
+
+```
+function runAgent(userMessage, tools):
+    messages = [{ role: "user", content: userMessage }]
+
+    while true:
+        response = callLLM(system, tools, messages)
+
+        // Add the assistant's response to history
+        messages.push({ role: "assistant", content: response.content })
+
+        // Check if the LLM wants to use tools
+        if response.stop_reason != "tool_use":
+            return getTextFromResponse(response)   // Done!
+
+        // Extract all tool_use blocks from the response
+        toolCalls = response.content.filter(block => block.type == "tool_use")
+
+        // Execute each tool and collect results
+        results = []
+        for each call in toolCalls:
+            output = executeToolFromRegistry(call.name, call.input)
+            results.push({
+                type: "tool_result",
+                tool_use_id: call.id,
+                content: output
+            })
+
+        // Send all results back as one user message
+        messages.push({ role: "user", content: results })
+```
+
+That's the entire loop. Let's trace through it step by step:
+
+```mermaid
+flowchart TD
+    START(["User says: 'What's in package.json?'"])
+    INIT["messages = [user message]"]
+    CALL1["Call LLM with system + tools + messages"]
+    PARSE1{"stop_reason == 'tool_use'?"}
+    EXTRACT["Extract tool_use blocks from response"]
+    EXEC["Execute each tool, collect results"]
+    APPEND_A1["Push assistant message to messages"]
+    APPEND_U1["Push user message (tool results) to messages"]
+    CALL2["Call LLM with system + tools + messages<br/>(now 4 messages long)"]
+    PARSE2{"stop_reason == 'tool_use'?"}
+    DONE(["Return text to user"])
+
+    START --> INIT --> CALL1
+    CALL1 --> APPEND_A1
+    APPEND_A1 --> PARSE1
+    PARSE1 -->|"Yes"| EXTRACT --> EXEC --> APPEND_U1
+    APPEND_U1 -->|"Loop back"| CALL2
+    CALL2 --> PARSE2
+    PARSE2 -->|"No"| DONE
+    PARSE2 -->|"Yes<br/>(more tools needed)"| EXTRACT
+    PARSE1 -->|"No"| DONE
+```
+
+### Real TypeScript
+
+Here is a working implementation:
+
+```typescript
+interface ToolDefinition {
+  name: string
+  description: string
+  input_schema: Record<string, unknown>
+}
+
+interface Tool {
+  definition: ToolDefinition
+  execute: (input: Record<string, unknown>) => Promise<{ output: string; isError: boolean }>
+}
+
+// The tool registry: a map from name → Tool
+const toolRegistry = new Map<string, Tool>()
+
+function registerTool(tool: Tool) {
+  toolRegistry.set(tool.definition.name, tool)
+}
+
+// The agent loop
+async function runAgent(userMessage: string): Promise<string> {
+  const messages: any[] = [
+    { role: "user", content: userMessage }
+  ]
+
+  const toolDefinitions = [...toolRegistry.values()].map(t => t.definition)
+
+  while (true) {
+    // 1. Call the LLM
+    const response = await callAnthropicAPI({
+      model: "claude-sonnet-4-20250514",
+      max_tokens: 4096,
+      system: "You are a helpful coding assistant.",
+      tools: toolDefinitions,
+      messages: messages,
+    })
+
+    // 2. Add the assistant's full response to history
+    messages.push({ role: "assistant", content: response.content })
+
+    // 3. If the LLM is done, return the text
+    if (response.stop_reason !== "tool_use") {
+      const textBlock = response.content.find((b: any) => b.type === "text")
+      return textBlock?.text ?? ""
+    }
+
+    // 4. Extract all tool_use blocks
+    const toolCalls = response.content.filter((b: any) => b.type === "tool_use")
+
+    // 5. Execute each tool and collect results
+    const results: any[] = []
+    for (const call of toolCalls) {
+      const tool = toolRegistry.get(call.name)
+      let result: { output: string; isError: boolean }
+
+      if (!tool) {
+        result = { output: `Unknown tool: ${call.name}`, isError: true }
+      } else {
+        try {
+          result = await tool.execute(call.input)
+        } catch (err) {
+          result = { output: `Tool error: ${err}`, isError: true }
+        }
+      }
+
+      results.push({
+        type: "tool_result",
+        tool_use_id: call.id,         // Must match the id from the tool_use block
+        content: result.output,
+        is_error: result.isError,
+      })
+    }
+
+    // 6. Send all results back as one user message
+    messages.push({ role: "user", content: results })
+
+    // Loop continues — next iteration calls the LLM again
+  }
+}
+```
+
+**Key implementation details:**
+
+- **Step 2**: You push the assistant's response as-is to `messages`. This includes both `text` and `tool_use` blocks. You must replay the full response.
+- **Step 4**: One response can contain multiple `tool_use` blocks. You extract all of them.
+- **Step 5**: Tools execute sequentially in a for-loop. Each result gets the `tool_use_id` that matches the original call's `id`.
+- **Step 6**: All results go in **one** `user` message. Not one message per result — one message containing an array of `tool_result` blocks.
+
+---
+
+## A Complete Multi-Turn Example With Real Payloads
+
+Let's trace a realistic scenario: the user says "Fix the build error in my project." This takes 3 turns with 4 tool calls.
+
+### Turn 1 → LLM Requests Two Tools at Once
+
+**Request** (your loop sends this):
+
+```json
+{
+  "model": "claude-sonnet-4-20250514",
+  "system": "You are a helpful coding assistant.",
+  "tools": [
+    { "name": "read", "description": "Read a file...", "input_schema": { "..." : "..." } },
+    { "name": "bash", "description": "Run a shell command...", "input_schema": { "..." : "..." } },
+    { "name": "edit", "description": "Edit a file...", "input_schema": { "..." : "..." } }
+  ],
+  "messages": [
+    { "role": "user", "content": "Fix the build error in my project." }
+  ]
+}
+```
+
+**Response** (the LLM returns this):
+
+```json
+{
+  "role": "assistant",
+  "content": [
+    {
+      "type": "text",
+      "text": "Let me check the build output and look at your source code."
+    },
+    {
+      "type": "tool_use",
+      "id": "toolu_01_bash",
+      "name": "bash",
+      "input": { "command": "npm run build 2>&1" }
+    },
+    {
+      "type": "tool_use",
+      "id": "toolu_02_read",
+      "name": "read",
+      "input": { "file_path": "src/App.tsx" }
+    }
+  ],
+  "stop_reason": "tool_use"
+}
+```
+
+The LLM requested **two tools in one response**. The `content` array has three blocks: one text block and two `tool_use` blocks. Each tool call has its own unique `id`.
+
+**Your loop now:**
+1. Pushes this entire response as an `assistant` message to the history.
+2. Sees `stop_reason: "tool_use"` → continues looping.
+3. Extracts both `tool_use` blocks.
+4. Executes `bash("npm run build 2>&1")` → gets the build error output.
+5. Executes `read("src/App.tsx")` → gets the file contents.
+6. Bundles both results into one `user` message.
+
+### Turn 2 → LLM Sees Results, Makes a Fix
+
+**Request** (your loop sends this — messages now has 3 entries):
+
+```json
+{
+  "messages": [
+    {
+      "role": "user",
+      "content": "Fix the build error in my project."
+    },
+    {
+      "role": "assistant",
+      "content": [
+        { "type": "text", "text": "Let me check the build output and look at your source code." },
+        { "type": "tool_use", "id": "toolu_01_bash", "name": "bash", "input": { "command": "npm run build 2>&1" } },
+        { "type": "tool_use", "id": "toolu_02_read", "name": "read", "input": { "file_path": "src/App.tsx" } }
+      ]
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "tool_result",
+          "tool_use_id": "toolu_01_bash",
+          "content": "src/App.tsx(3,10): error TS2307: Cannot find module './Button'."
+        },
+        {
+          "type": "tool_result",
+          "tool_use_id": "toolu_02_read",
+          "content": "import React from 'react'\nimport { useState } from 'react'\nimport { Button } from './Button'\n\nexport function App() {\n  return <Button label=\"Click me\" />\n}"
+        }
+      ]
+    }
+  ]
+}
+```
+
+Notice the pattern: `user → assistant → user`. The tool results in the third message each carry a `tool_use_id` that ties back to the corresponding `tool_use` block in the second message. This is how the LLM knows which result belongs to which call.
+
+**Response:**
+
+```json
+{
+  "role": "assistant",
+  "content": [
+    {
+      "type": "text",
+      "text": "The build error says it can't find the './Button' module. The file imports from './Button' but that file doesn't exist. Let me create it."
+    },
+    {
+      "type": "tool_use",
+      "id": "toolu_03_edit",
+      "name": "write",
+      "input": {
+        "file_path": "src/Button.tsx",
+        "content": "import React from 'react'\n\nexport function Button({ label }: { label: string }) {\n  return <button>{label}</button>\n}\n"
+      }
+    }
+  ],
+  "stop_reason": "tool_use"
+}
+```
+
+The LLM reasoned about the error (text block), then requested a write to create the missing file (tool_use block).
+
+### Turn 3 → LLM Verifies the Fix
+
+**Request** (messages now has 5 entries — the conversation keeps growing):
+
+```json
+{
+  "messages": [
+    { "role": "user", "content": "Fix the build error in my project." },
+    { "role": "assistant", "content": ["(Turn 1 response — text + 2 tool_use blocks)"] },
+    { "role": "user", "content": ["(Turn 1 tool results — 2 tool_result blocks)"] },
+    { "role": "assistant", "content": ["(Turn 2 response — text + 1 tool_use block)"] },
+    { "role": "user", "content": [
+        { "type": "tool_result", "tool_use_id": "toolu_03_edit", "content": "File created: src/Button.tsx" }
+      ]
+    }
+  ]
+}
+```
+
+**Response:**
+
+```json
+{
+  "role": "assistant",
+  "content": [
+    {
+      "type": "tool_use",
+      "id": "toolu_04_verify",
+      "name": "bash",
+      "input": { "command": "npm run build 2>&1" }
+    }
+  ],
+  "stop_reason": "tool_use"
+}
+```
+
+Notice: **no text block this time.** The LLM can respond with only tool calls and no text — or only text and no tool calls — or both. The `content` array is flexible.
+
+Your loop executes the build, it succeeds. Sends the result back.
+
+### Turn 4 → LLM Reports Done
+
+**Response:**
+
+```json
+{
+  "role": "assistant",
+  "content": [
+    {
+      "type": "text",
+      "text": "Fixed! The build error was caused by a missing Button component. I created src/Button.tsx with the Button component that App.tsx was importing."
+    }
+  ],
+  "stop_reason": "end_turn"
+}
+```
+
+`stop_reason: "end_turn"` — the loop exits. The text is returned to the user.
+
+**Here is the full flow visualized:**
 
 ```mermaid
 sequenceDiagram
-    participant You
+    participant User
     participant Loop as Agent Loop
     participant LLM
     participant Disk as Your Computer
 
-    You ->> Loop: "What's in my package.json?"
-    Loop ->> LLM: [tools list] + [your message]
-    LLM ->> Loop: "Let me read that"<br/>+ TOOL: read("package.json") id="toolu_01ABC"
-    Loop ->> Disk: read("package.json")
-    Disk ->> Loop: { "name": "my-app", "version": "1.0.0" }
-    Loop ->> LLM: RESULT for toolu_01ABC: { "name": "my-app"... }
-    LLM ->> Loop: "Your project is called 'my-app', version 1.0.0"
-    Loop ->> You: "Your project is called 'my-app', version 1.0.0"
-```
+    User ->> Loop: "Fix the build error"
 
----
-
-## Message Format: Why Tool Results Go in User Messages
-
-This is a technical detail that matters for implementing the loop correctly.
-
-**The Anthropic API requires strictly alternating roles.** Every call must follow the pattern: `user, assistant, user, assistant, ...`. You cannot send two `user` messages in a row or two `assistant` messages in a row. The API will reject the request with a 400 error.
-
-This creates a formatting problem. The agent uses a single internal `Message` object that stores everything from one turn together — the LLM's text, its tool calls, and the tool results. But the API requires the tool results to be in a `user` message, not an `assistant` message.
-
-The message converter (`src/backend/agent/message-converter.ts`) handles this split. It converts the internal storage format to the API format every time the loop calls the LLM:
-
-```
-Internal storage (one Message object, role="assistant"):
-  parts:
-    - { type: "text", text: "Let me read that" }
-    - { type: "tool_call", toolCallId: "toolu_01ABC", toolName: "read", input: {...} }
-    - { type: "tool_result", toolCallId: "toolu_01ABC", output: "{ name: my-app... }" }
-
-API format (two LLMMessage objects):
-  { role: "assistant", content: [
-      { type: "text", text: "Let me read that" },
-      { type: "tool_use", id: "toolu_01ABC", name: "read", input: {...} }
-  ]}
-  { role: "user", content: [
-      { type: "tool_result", tool_use_id: "toolu_01ABC", content: "{ name: my-app... }" }
-  ]}
-```
-
-The `tool_use_id` field in the result matches the `id` from the original tool call. That is how the LLM knows which result belongs to which call.
-
----
-
-## Multi-Tool Batching: Multiple Tool Calls in One Response
-
-The LLM can return **multiple tool calls in a single response**. This is common — for a bug fix task, it might request `read("src/App.tsx")` and `bash("npm run build")` at the same time.
-
-**The loop executes all of them before calling the LLM again.** It does not call the LLM after each individual tool. All results are collected and sent back together in one batch.
-
-Here is what the loop does when it receives multiple tool calls:
-
-```mermaid
-sequenceDiagram
-    participant Loop as Agent Loop
-    participant LLM
-    participant Disk
-
-    LLM ->> Loop: TOOL: read("src/App.tsx") id="toolu_01"<br/>TOOL: bash("npm run build") id="toolu_02"
-
-    Note over Loop: Execute all pending tool calls.<br/>Non-spawn_agent tools run sequentially.
-
+    Note over Loop: Turn 1
+    Loop ->> LLM: messages=[user msg] + tools=[read, bash, edit]
+    LLM ->> Loop: text + tool_use(bash) + tool_use(read)<br/>stop_reason="tool_use"
+    Loop ->> Disk: bash("npm run build")
+    Disk ->> Loop: "error TS2307: Cannot find module './Button'"
     Loop ->> Disk: read("src/App.tsx")
     Disk ->> Loop: [file contents]
+
+    Note over Loop: Turn 2
+    Loop ->> LLM: messages=[user, assistant, user(2 results)] + tools
+    LLM ->> Loop: text + tool_use(write "src/Button.tsx")<br/>stop_reason="tool_use"
+    Loop ->> Disk: write("src/Button.tsx", ...)
+    Disk ->> Loop: "File created"
+
+    Note over Loop: Turn 3
+    Loop ->> LLM: messages=[...5 messages...] + tools
+    LLM ->> Loop: tool_use(bash "npm run build")<br/>stop_reason="tool_use"
     Loop ->> Disk: bash("npm run build")
-    Disk ->> Loop: "Error: Cannot find module './Button'"
+    Disk ->> Loop: "Build successful"
 
-    Note over Loop: All results collected.<br/>Now call the LLM with both results.
-
-    Loop ->> LLM: RESULT toolu_01: [file contents]<br/>RESULT toolu_02: "Error: Cannot find module './Button'"
-    LLM ->> Loop: "I see the issue — missing import..."<br/>TOOL: edit("src/App.tsx", ...)
+    Note over Loop: Turn 4
+    Loop ->> LLM: messages=[...7 messages...] + tools
+    LLM ->> Loop: "Fixed! The issue was..."<br/>stop_reason="end_turn"
+    Loop ->> User: "Fixed! The issue was..."
 ```
 
-**All results go in one user message.** The API receives a single `user` message containing multiple `tool_result` blocks, one per tool call. The `tool_use_id` on each block tells the LLM which result corresponds to which call.
+Each turn, the `messages` array grows by 2 (one assistant message, one user message with tool results). By Turn 4, the LLM is receiving 7 messages plus all tool definitions plus the system prompt — the full conversation history replayed from the start. This is what "the LLM has no memory" means in practice.
 
-**Execution order:** Most tools run sequentially, one after another. The one exception is `spawn_agent` — sub-agents run in parallel with each other (but still after all sequential tools complete). See [Layer 4: Sub-Agents](./subagents.md) for details.
+---
 
-**The loop exit condition:** After collecting all tool results, the loop checks the LLM's `stopReason`. If it is `"tool_use"`, the loop continues. If it is anything else (typically `"end_turn"`), the loop stops — even if there was also text in the response. A response can contain both text and tool calls simultaneously; the loop will always execute the tool calls and then decide whether to continue based on `stopReason`.
+## The Conversation Shape: Alternating Roles
+
+Here is the exact shape of `messages` after all 4 turns. This pattern is the same for any tool-using conversation:
+
+```
+messages[0]  role: "user"       → Your original question
+messages[1]  role: "assistant"  → LLM text + tool_use(bash) + tool_use(read)
+messages[2]  role: "user"       → tool_result(bash) + tool_result(read)
+messages[3]  role: "assistant"  → LLM text + tool_use(write)
+messages[4]  role: "user"       → tool_result(write)
+messages[5]  role: "assistant"  → tool_use(bash)
+messages[6]  role: "user"       → tool_result(bash)
+messages[7]  role: "assistant"  → LLM text (final answer)
+```
+
+The pattern is always: `user → assistant → user → assistant → ...`
+
+Every `assistant` message is exactly what the LLM returned. Every `user` message after the first one contains `tool_result` blocks that your loop created. The API **requires** this strict alternation — send two `user` messages in a row and you get a 400 error.
+
+---
+
+## Multiple Tool Calls: How and Why
+
+The LLM can return **multiple `tool_use` blocks in one response**. We saw this in Turn 1 of the example above, where it requested `bash` and `read` simultaneously.
+
+### Why does the LLM do this?
+
+The LLM is trying to be efficient. If it needs two pieces of information that are independent (the build output and the source code), it requests both at once instead of waiting for one result before asking for the next. This saves a round-trip.
+
+### How the loop handles it
+
+When the loop extracts `tool_use` blocks from the response, it may find more than one. The implementation is straightforward — execute them one by one in a for-loop and collect all results:
+
+```typescript
+// Extract ALL tool_use blocks (there may be 1, 2, or more)
+const toolCalls = response.content.filter(b => b.type === "tool_use")
+
+// Execute each one sequentially
+const results = []
+for (const call of toolCalls) {
+  const output = await executeTool(call.name, call.input)
+  results.push({
+    type: "tool_result",
+    tool_use_id: call.id,      // Ties this result to the specific tool_use block
+    content: output.text,
+    is_error: output.isError,
+  })
+}
+
+// All results go in ONE user message
+messages.push({ role: "user", content: results })
+```
+
+### The batching rule
+
+**All tool results from one LLM response go into one user message.** You do not make a separate API call after each tool execution. You wait until all tools have been executed, then send all results at once.
+
+```mermaid
+flowchart TD
+    subgraph WRONG ["❌ WRONG: One result per API call"]
+        W1["LLM returns: tool_use(A) + tool_use(B)"]
+        W2["Execute A, send result A to LLM"]
+        W3["LLM responds..."]
+        W4["Execute B, send result B to LLM"]
+        W1 --> W2 --> W3 --> W4
+    end
+
+    subgraph RIGHT ["✅ RIGHT: All results batched into one message"]
+        R1["LLM returns: tool_use(A) + tool_use(B)"]
+        R2["Execute A"]
+        R3["Execute B"]
+        R4["Send both results in one user message"]
+        R5["Call LLM once"]
+        R1 --> R2 --> R3 --> R4 --> R5
+    end
+```
+
+Why? Because the API requires it. Each `tool_use` block in the assistant message must have a corresponding `tool_result` block in the next user message. If you only send one result, the API will reject the request because the other `tool_use` block has no matching result.
 
 ---
 
 ## The Tool Registry
 
-An agent has many tools (this codebase has 20+). The tool registry (`src/backend/tools/registry.ts`) is a `Map<string, Tool>` that stores every available tool.
+An agent has many tools (this codebase has 20+). The tool registry is a `Map<string, Tool>` that stores every available tool.
 
 Each entry in the map holds **two distinct things**:
 
-1. **`definition`** (`ToolDefinition`) — the JSON object sent to the LLM. Contains `name`, `description`, and `inputSchema`. This is what the LLM reads to understand what the tool does.
+1. **`definition`** (`ToolDefinition`) — the JSON object sent to the LLM. Contains `name`, `description`, and `input_schema`. This is text the LLM reads.
 
-2. **`execute`** — a TypeScript async function that runs when the LLM calls the tool. This function receives the input the LLM provided and a context object with the session ID, project path, and other runtime information.
-
-Here is the actual `Tool` interface from the code:
+2. **`execute`** — a TypeScript async function that runs when the LLM calls the tool. This is code that runs on your machine.
 
 ```typescript
-// src/backend/tools/registry.ts
 export interface Tool {
-  definition: ToolDefinition   // what gets sent to the LLM (JSON schema)
+  definition: ToolDefinition
   execute: (input: Record<string, unknown>, context: ToolContext) => Promise<ToolResult>
-  //        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  //        the live callable that runs on your machine
 }
 ```
 
-And here is a complete tool definition from the codebase (`src/backend/tools/read.tool.ts`):
+Here is a complete tool:
 
 ```typescript
 export const readTool: Tool = {
   definition: {
     name: 'read',
     description: 'Read the contents of a file. The file_path must be relative to the project directory.',
-    inputSchema: {
+    input_schema: {
       type: 'object',
       properties: {
         file_path: { type: 'string', description: 'Relative path to the file to read' },
@@ -285,10 +807,7 @@ export const readTool: Tool = {
 }
 ```
 
-The loop uses the registry in two ways:
-
-- **`toolRegistry.getDefinitions()`** — returns all `definition` objects, sent to the LLM on every call
-- **`toolRegistry.execute(name, input, context)`** — looks up the tool by name and runs its `execute` function
+The separation is the whole point. The `definition` is what the LLM reads (pure text/data). The `execute` is what your computer runs (real code with side effects). They are connected by name, but they live in completely different worlds.
 
 ```mermaid
 flowchart TD
@@ -302,259 +821,154 @@ flowchart TD
         T6["... more tools"]
     end
 
-    LLM["LLM says:<br/>tool_call('read', { file_path: 'package.json' })"]
-    LOOKUP["Loop calls toolRegistry.execute('read', input, ctx)"]
-    EXEC["Runs the execute() function<br/>Returns: { output: '...', isError: false }"]
+    subgraph TEXT_WORLD ["Text World (sent to LLM)"]
+        DEF["toolRegistry.getDefinitions()<br/>→ array of definition objects"]
+    end
 
-    LLM --> LOOKUP
-    LOOKUP --> REGISTRY
+    subgraph REAL_WORLD ["Real World (runs on your machine)"]
+        EXEC["toolRegistry.execute('read', input, ctx)<br/>→ looks up tool, runs execute()"]
+    end
+
+    REGISTRY --> DEF
     REGISTRY --> EXEC
 ```
 
-**Who decides which tools the LLM can call?** The loop sends a filtered subset of the registry each turn — not necessarily all registered tools. In the agent loop (`src/backend/agent/agent-loop.ts`), tool definitions are filtered by MCP server and app activation state before being sent to the LLM. At startup with no plugins activated, around 22 core tools are included. The progressive-discovery layer (Layer 1+) explains why the full registry is not always sent and how the LLM can activate additional tools on demand.
-
----
-
-## Input Validation: Who Validates the Schema?
-
-The `inputSchema` in a tool definition serves two purposes:
-
-1. **For the LLM** — it tells the LLM what fields to provide and what types they should be
-2. **For the loop** — it could validate what the LLM actually sends before calling `execute`
-
-In this codebase, the LLM is trusted to fill in the input correctly. There is **no automatic schema validation** run by the loop before `execute` is called. The tool's `execute` function is responsible for handling unexpected or missing inputs gracefully. For example, the `read` tool casts `input.file_path as string` and would fail if the LLM sent the wrong type — but in practice, modern LLMs almost always follow the schema correctly.
-
-If the LLM calls a tool that does not exist in the registry (for example, due to a model hallucination), the registry returns an error result instead of throwing:
-
-```typescript
-// From registry.ts
-async execute(name, input, context): Promise<ToolResult> {
-  const tool = this.tools.get(name)
-  if (!tool) {
-    return { output: `Unknown tool: ${name}`, isError: true }
-  }
-  // ...
-}
-```
-
----
-
-## How This Changes Layer 0
-
-Remember the simple loop from Layer 0? Now we can fill in the details:
-
-```mermaid
-flowchart TD
-    START(["You send a message"])
-
-    subgraph LOOP ["The Agent Loop (updated with tools)"]
-        BUILD["Build the prompt:<br/>- system prompt<br/>- tool definitions (from registry) ← NEW<br/>- conversation history"]
-        CALL["Send to the LLM"]
-        CHECK{"LLM stopReason<br/>= 'tool_use'?"}
-        EXEC["Execute ALL pending tool calls<br/>sequentially (except spawn_agent) ← NEW"]
-        COLLECT["Collect all results into<br/>one user message ← NEW"]
-        ADD["Add assistant message + user message<br/>(tool results) to history"]
-        DONE(["Return final text to you"])
-
-        BUILD --> CALL
-        CALL --> CHECK
-        CHECK -->|"Yes"| EXEC
-        EXEC --> COLLECT
-        COLLECT --> ADD
-        ADD -->|"Loop again"| BUILD
-        CHECK -->|"No"| DONE
-    end
-
-    START --> BUILD
-```
-
-Two things changed from Layer 0:
-1. **Tool definitions** from the registry are now part of every prompt
-2. **Tool execution** replaces the vague "do the action" step — and all results from one response are batched before the next LLM call
+The loop uses the registry in two ways:
+- **`getDefinitions()`** — returns all `definition` objects, sent to the LLM on every call
+- **`execute(name, input, context)`** — looks up the tool by name and runs its `execute` function
 
 ---
 
 ## Error Handling: Errors Are Just Data
 
-When a tool fails, the error is returned as the tool result — not thrown as an exception. The loop catches all errors in the registry's `execute` wrapper and returns `{ output: errorMessage, isError: true }`. The LLM sees the error and can decide how to recover:
+When a tool fails, the error is returned as the tool result — not thrown as an exception. The loop catches all errors in the registry's `execute` wrapper:
+
+```typescript
+async execute(name: string, input: Record<string, unknown>): Promise<ToolResult> {
+  const tool = this.tools.get(name)
+  if (!tool) {
+    return { output: `Unknown tool: ${name}`, isError: true }
+  }
+  try {
+    return await tool.execute(input, context)
+  } catch (err) {
+    return { output: `Tool error: ${String(err)}`, isError: true }
+  }
+}
+```
+
+The `isError: true` flag becomes `is_error: true` in the `tool_result` block sent to the API. The LLM sees it and adapts:
 
 ```mermaid
 sequenceDiagram
     participant LLM
     participant Loop as Agent Loop
 
-    LLM ->> Loop: TOOL: bash("npm install")
-    Loop ->> Loop: Runs command...<br/>npm ERR! 404 Not Found: some-pkg
-    Loop ->> LLM: RESULT (isError=true): "npm ERR! 404 Not Found: some-pkg"
-    Note over LLM: "That package name is wrong.<br/>Let me check the correct name in package.json first..."
-    LLM ->> Loop: TOOL: read("package.json")
-    Loop ->> Loop: Reads file...
-    Loop ->> LLM: RESULT: { "dependencies": { "correct-pkg": "^1.0.0" } }
-    LLM ->> Loop: TOOL: bash("npm install correct-pkg")
-    Loop ->> Loop: Runs command... success!
-    Loop ->> LLM: RESULT: "added 1 package"
+    LLM ->> Loop: tool_use: bash("npm install nonexistent-pkg")
+    Loop ->> Loop: Runs command → fails
+    Loop ->> LLM: tool_result (is_error=true):<br/>"npm ERR! 404 Not Found: nonexistent-pkg"
+
+    Note over LLM: Reads the error, reasons about it,<br/>decides to check package.json first
+
+    LLM ->> Loop: tool_use: read("package.json")
+    Loop ->> LLM: tool_result: { "dependencies": { "real-pkg": "^1.0" } }
+    LLM ->> Loop: tool_use: bash("npm install real-pkg")
+    Loop ->> LLM: tool_result: "added 1 package"
+    LLM ->> Loop: "Fixed! The package name was wrong."<br/>stop_reason="end_turn"
 ```
 
-This is one of the most important aspects of the design: **errors become information** that the LLM reasons about, rather than exceptions that crash the program. The `isError: true` flag is passed through to the API as `is_error: true` on the `tool_result` block, which signals to the LLM that the result is an error rather than successful output.
+This is one of the most important design principles: **errors become information** that the LLM reasons about, rather than exceptions that crash the program. A crashing tool cannot crash the agent loop.
+
+---
+
+## Input Validation: Trust, But Verify (Or Don't)
+
+The `input_schema` in a tool definition serves two audiences:
+
+1. **For the LLM** — it tells the LLM what fields to provide and what types they should be
+2. **For the loop** — it *could* validate what the LLM actually sends before calling `execute`
+
+In practice, most implementations (including this codebase) **trust the LLM** to fill in the input correctly. There is no automatic schema validation before `execute` is called. The tool's `execute` function handles unexpected inputs itself:
+
+```typescript
+// The LLM is trusted to send a string. If it doesn't, this will fail gracefully.
+const filePath = input.file_path as string
+```
+
+Modern LLMs almost always follow the schema correctly. The edge case is hallucinated tool names — when the LLM invents a tool that doesn't exist. The registry handles this by returning an error instead of throwing (shown in the error handling section above).
 
 ---
 
 ## Security: What Is Actually Implemented
 
-Tools give the LLM real power over your computer. Here is what is implemented in this codebase today:
+Tools give the LLM real power over your computer. Here is what this codebase implements:
 
-**1. Path traversal prevention (implemented in each file tool)**
-
-The `read`, `write`, and `edit` tools resolve the provided path and check that it stays within the project root before doing anything. If the LLM tries to access `/etc/passwd` or `../../sensitive-file`, the tool returns an error immediately:
+**1. Path traversal prevention** — File tools (`read`, `write`, `edit`) resolve the path and verify it stays within the project root:
 
 ```typescript
-// From read.tool.ts
 if (fullPath !== projectRoot && !fullPath.startsWith(projectPrefix)) {
   return { output: 'Error: Path traversal detected', isError: true }
 }
 ```
 
-**2. Planning mode / read-only mode (implemented in the loop and as a tool)**
+**2. Planning mode** — Blocks all file-mutating tools. The loop intercepts blocked calls before execution.
 
-Planning mode blocks all file-mutating tools (`write`, `edit`, `multi_edit`). It is activated in two ways: (a) the caller passes `planningMode: true` to `runAgent`, or (b) the LLM calls the `enter_plan_mode` tool during a session. When active, the loop intercepts any blocked tool call before execution and returns a message explaining the restriction:
+**3. Abort signal** — An `AbortController` signal is passed to every tool. Long-running tools (like `bash`) check it to stop early when you click Stop.
 
-```typescript
-// From agent-loop.ts
-if ((options?.planningMode || sessionContext.isInPlanMode(sessionId))
-    && FILE_MUTATING_TOOLS.has(tc.name)) {
-  return `[PLANNING MODE] Tool "${tc.name}" is blocked in planning mode.`
-}
-```
+**4. Output truncation** — Large tool outputs are truncated before being sent to the LLM to prevent consuming the entire context window.
 
-The LLM can exit planning mode by calling `exit_plan_mode`.
-
-**3. Abort signal propagation (implemented in the loop and tool context)**
-
-The loop creates an `AbortController` at session start. Its `signal` is passed to every tool in the `ToolContext`. Tools that run long operations (like `bash`) can check `context.abortSignal?.aborted` to stop early. When you click Stop, the abort controller fires and the loop exits cleanly after the current tool finishes.
-
-**4. Tool output truncation (implemented in the loop)**
-
-Large tool outputs are sanitized before being sent to the LLM. The message converter filters out empty image blocks that would cause API errors. Individual tools (like `read`) accept `offset` and `limit` parameters to read files in chunks rather than loading the entire file into the context. This prevents extremely long tool outputs from consuming the entire context window. The context window is a finite limit — if the conversation (including tool results) gets too large, the LLM will not be able to process it. Layer 2 covers how the loop handles context overflow.
-
-**5. Error isolation (implemented in the registry)**
-
-All tool execution is wrapped in a try/catch in `toolRegistry.execute`. An unhandled exception inside a tool's `execute` function is caught and returned as `{ output: "Tool error: ...", isError: true }`. This means a crashing tool cannot crash the agent loop.
+**5. Error isolation** — All tool execution is wrapped in try/catch. A crashing tool returns an error result, not an exception.
 
 ---
 
-## Example: Multi-Tool Bug Fix
+## How This Changes Layer 0
 
-Here is a realistic example with multiple tools across multiple turns:
+The simple loop from Layer 0 now has concrete mechanics:
 
 ```mermaid
 flowchart TD
-    subgraph T1 ["Turn 1: Diagnose (two tools in one response)"]
-        T1A["TOOL: read('src/App.tsx')   id='toolu_01'"]
-        T1B["TOOL: bash('npm run build')  id='toolu_02'"]
-        T1C["Both execute sequentially.<br/>Results batched into one user message:<br/>- toolu_01: file contents<br/>- toolu_02: build error output"]
-        T1A --> T1C
-        T1B --> T1C
+    START(["You send a message"])
+
+    subgraph LOOP ["The Agent Loop (updated with tools)"]
+        BUILD["Build the API request:<br/>- system prompt<br/>- tools array (from registry)<br/>- messages array (full history)"]
+        CALL["POST to LLM API"]
+        PUSH_A["Push assistant response to messages"]
+        CHECK{"stop_reason<br/>== 'tool_use'?"}
+        EXTRACT["Extract tool_use blocks from response.content"]
+        EXEC["Execute each tool via registry"]
+        COLLECT["Build tool_result blocks<br/>(one per tool_use, matched by id)"]
+        PUSH_U["Push user message (all results) to messages"]
+        DONE(["Return final text to you"])
+
+        BUILD --> CALL --> PUSH_A --> CHECK
+        CHECK -->|"Yes"| EXTRACT --> EXEC --> COLLECT --> PUSH_U
+        PUSH_U -->|"Loop again"| BUILD
+        CHECK -->|"No"| DONE
     end
 
-    subgraph T2 ["Turn 2: Fix (one tool)"]
-        T2A["LLM: 'I see the issue — missing import'"]
-        T2B["TOOL: edit('src/App.tsx', ...)"]
-        T2C["Result: 'File edited successfully'"]
-        T2A --> T2B --> T2C
-    end
-
-    subgraph T3 ["Turn 3: Verify (one tool)"]
-        T3A["TOOL: bash('npm run build')"]
-        T3B["Result: 'Build successful'"]
-        T3A --> T3B
-    end
-
-    subgraph T4 ["Turn 4: Report (no tools)"]
-        T4A["LLM: 'Fixed! The issue was<br/>a missing import on line 12.'"]
-        T4B["stopReason = 'end_turn' → loop ends"]
-        T4A --> T4B
-    end
-
-    T1 --> T2 --> T3 --> T4
+    START --> BUILD
 ```
-
-Turn 1 demonstrates multi-tool batching. The LLM requested two tools simultaneously. The loop ran them sequentially, collected both results, and sent them back in one user message before calling the LLM again.
-
----
-
-## Common Tool Categories
-
-The tools registered in this codebase fall into these groups:
-
-### File and Code Tools
-
-| Tool | What It Does |
-|------|-------------|
-| `read` | Read a file from disk (with optional line range) |
-| `write` | Create or overwrite a file |
-| `edit` | Make a targeted string replacement in a file |
-| `multi_edit` | Apply multiple edits to a file in one call |
-| `glob` | Find files by name pattern |
-| `grep` | Search file contents with regex |
-| `bash` | Execute a shell command |
-
-### Preview / Browser Tools
-
-| Tool | What It Does |
-|------|-------------|
-| `preview_screenshot` | Capture a screenshot of the preview pane |
-| `preview_dom_snapshot` | Get the DOM as text |
-| `preview_console_logs` | Read browser console output |
-| `preview_interact` | Click, type, or scroll in the preview |
-| `preview_network_logs` | Read network request logs |
-
-### Agent Control Tools
-
-| Tool | What It Does |
-|------|-------------|
-| `ask_question` | Ask you a question and pause the loop until you answer |
-| `enter_plan_mode` | Switch to read-only planning mode |
-| `exit_plan_mode` | Return from planning mode to normal mode |
-| `activate_skill` | Load a skill's instructions into the conversation |
-| `activate_app` | Activate an app plugin and register its tools |
-| `spawn_agent` | Start a parallel sub-agent (see [Layer 4](./subagents.md)) |
-
-> **Note:** This is the set of tools that ship with this codebase. It is not an exhaustive reference — the registry can be extended, and plugins (activated via `activate_app`) add more tools at runtime.
-
----
-
-## What We Have So Far
-
-```mermaid
-flowchart TD
-    subgraph AGENT ["Our Agent So Far"]
-        LOOP["Layer 0: The Loop<br/>Keeps calling the LLM<br/>until done"]
-        TOOLS["Layer 1: Tools<br/>LLM requests tools,<br/>loop executes them,<br/>results batched per turn"]
-
-        LOOP <-->|"tool calls<br/>& results"| TOOLS
-    end
-
-    PROBLEM["But wait...<br/>Sending all tool definitions every turn is expensive.<br/>With 100+ tools, the LLM also picks poorly.<br/>What is the actual limit?<br/>Around 20-30 tools is the practical sweet spot.<br/>Beyond that, accuracy drops and token cost rises."]
-
-    AGENT --> PROBLEM
-    PROBLEM -->|"Solved in"| NEXT["Layer 1+: Progressive Discovery →<br/>(load tools on demand, not all at once)"]
-```
-
-The registry currently supports dynamic addition and removal of tools (`register` / `unregister`). However, the mechanism for doing this mid-session — activating plugins that add new tools while the agent is running — is explained in [Layer 1+: Progressive Discovery](./progressive-discovery.md). If you add a tool to the registry between turns, it will appear in the tool list on the very next LLM call, because `toolRegistry.getDefinitions()` is called fresh at the start of each loop iteration.
 
 ---
 
 ## Key Takeaways
 
-1. **Tools are the bridge** between the LLM (text only) and the real world (your computer)
-2. **Two separate things per tool**: a `definition` (JSON schema sent to the LLM) and an `execute` function (the TypeScript callable that runs locally)
-3. **The `id` field** on a tool call is generated by the LLM and used to match results back to calls — critical when multiple tools are called in one response
-4. **Multiple tool calls in one response** are all executed before the LLM is called again; all results go in one user message
-5. **Tool results go in user messages** because the Anthropic API requires strictly alternating roles — the message converter splits internal storage into the API format
-6. **Errors are just data** — tool failures return `{ isError: true }` rather than throwing; the LLM sees the error and adapts
-7. **Real security measures** include path traversal checks (per tool), planning mode (blocks writes at the loop level), abort signal propagation (for cancellation), and error isolation (registry catches all exceptions)
-8. **The loop does not validate input schema** — the LLM is trusted to fill in inputs correctly; tools cast and handle bad input themselves
+1. **Tool calling is just text.** The LLM outputs structured JSON (`tool_use` blocks). Your code parses that JSON and runs real functions. The LLM never touches the real world directly.
+
+2. **The LLM was trained to produce this format.** The API provider (Anthropic, OpenAI) fine-tuned the model to recognize tool definitions and output `tool_use` blocks. Your descriptions guide *which* tool and *what input* — the format is already learned.
+
+3. **Every API call replays the full conversation.** System prompt, tool definitions, and the entire message history are sent every time. The LLM has no memory between calls.
+
+4. **Tool results go in user messages.** The API requires strictly alternating `user → assistant → user → ...` roles. Tool results are the "user's reply" to the assistant's tool request.
+
+5. **Multiple tool calls → one batched response.** All `tool_use` blocks in one response are executed before the next API call. All results go in one user message, matched by `tool_use_id`.
+
+6. **`stop_reason` drives the loop.** `"tool_use"` means keep going. `"end_turn"` means stop. That's the only decision the loop makes.
+
+7. **Errors are just data.** Tool failures return `{ is_error: true }` with the error text. The LLM reads the error and decides what to do — no exceptions, no crashes.
+
+8. **Two things per tool: definition + execute.** The definition is text for the LLM. The execute function is code for your machine. They're connected by name but live in different worlds.
 
 ---
 
-> **Next:** [Layer 1+: Progressive Discovery](./progressive-discovery.md) — What happens when you have too many tools? How does the registry grow at runtime?
+> **Next:** [Layer 1+: Progressive Discovery](./progressive-discovery.md) — What happens when you have too many tools? Sending 100+ definitions every turn wastes tokens and confuses the LLM. How does the registry grow at runtime?
