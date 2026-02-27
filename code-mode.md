@@ -160,6 +160,380 @@ flowchart TD
 
 ---
 
+## What the LLM Actually Sees: The Raw API Calls
+
+> **If you read [Layer 1: Tools](./tool-execution.md), you saw what traditional tool calls look like in raw HTTP payloads. This section shows the same thing for code mode — the actual JSON that flows between your loop and the LLM.**
+
+### The Two Tool Definitions (Sent Every Call)
+
+Here is the literal `tools` array that gets sent to the API. This is all the LLM ever sees about plugin capabilities — two generic tools, no matter how many plugins are connected:
+
+```json
+{
+  "model": "claude-sonnet-4-20250514",
+  "max_tokens": 4096,
+  "system": "You are a helpful coding assistant. When you need to interact with external services (error tracking, design tools, databases, etc.), use search_apis to discover available methods, then use execute_code to call them.",
+
+  "tools": [
+    {
+      "name": "read",
+      "description": "Read the contents of a file...",
+      "input_schema": { "..." : "..." }
+    },
+    {
+      "name": "edit",
+      "description": "Edit a file...",
+      "input_schema": { "..." : "..." }
+    },
+    {
+      "name": "search_apis",
+      "description": "Search for available API methods across all connected services. Returns TypeScript signatures for matching methods. Use this to discover what methods are available before writing code with execute_code.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "Natural language description of what you're looking for, e.g. 'list errors by project' or 'get design components'"
+          }
+        },
+        "required": ["query"]
+      }
+    },
+    {
+      "name": "execute_code",
+      "description": "Execute JavaScript/TypeScript code in a sandboxed environment. The code can call API methods discovered via search_apis. Available globals are injected per-plugin (e.g., sentry.*, figma.*, db.*). Use console.log() to output results — return values are not captured. The code runs with a 10-second timeout.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "JavaScript/TypeScript code to execute. Use console.log() for any output you want to see in the result."
+          }
+        },
+        "required": ["code"]
+      }
+    }
+  ],
+
+  "messages": [
+    { "role": "user", "content": "Check for recent login crashes in our web app" }
+  ]
+}
+```
+
+That's it. **22 built-in tools + `search_apis` + `execute_code` = 24 tools, always.** Whether you have 0 plugins or 50 plugins connected, this array never changes.
+
+Compare this to the traditional approach where the same request would need the full Sentry tool set sent:
+
+```
+Traditional:   22 built-in + 10 Sentry tools = 32 tool definitions
+Code mode:     22 built-in + 2 generic tools = 24 tool definitions (forever)
+```
+
+### How the LLM Knows What Code to Write
+
+This is the key question. With traditional tool calling, the LLM sees explicit JSON Schema definitions for each tool — `sentry_list_errors`, `sentry_get_detail`, etc. — and picks one. With code mode, the LLM sees just `execute_code` with a `code` string input. How does it know what to write?
+
+**The answer: it doesn't know yet.** That's why there are **two** tools, not one. The flow is:
+
+```mermaid
+flowchart TD
+    subgraph TRADITIONAL ["Traditional: LLM Knows Everything Upfront"]
+        direction TB
+        T1["LLM reads 10 Sentry tool definitions\n(~2,000 tokens of JSON Schema)"]
+        T2["Picks sentry_list_errors\nwith the right arguments"]
+    end
+
+    subgraph CODE_MODE ["Code Mode: LLM Discovers Then Codes"]
+        direction TB
+        C1["LLM reads 2 generic tool definitions\n(~400 tokens)"]
+        C2["Doesn't know what methods exist yet\n→ calls search_apis first"]
+        C3["Gets back TypeScript signatures\nas a tool result"]
+        C4["NOW knows the exact methods\n→ writes code against them"]
+    end
+
+    T1 --> T2
+    C1 --> C2 --> C3 --> C4
+```
+
+**The search result IS the documentation.** When `search_apis` returns:
+
+```typescript
+/** List errors for a project filtered by query */
+sentry.listErrors(project: string, query?: string): Error[]
+
+interface Error {
+  id: string;
+  level: "fatal" | "error" | "warning";
+  message: string;
+  timestamp: string;
+}
+```
+
+...the LLM reads this exactly like a developer reads API docs. It sees:
+- The function name: `sentry.listErrors`
+- The parameters: `project` (required string), `query` (optional string)
+- The return type: an array of `Error` objects
+- The shape of `Error`: what fields it has and their types
+
+This is enough to write correct code. The LLM has seen millions of TypeScript function signatures during training. Writing `await sentry.listErrors("web-app")` is as natural to it as writing `await fetch("/api/users")`.
+
+**Why TypeScript signatures work better than JSON Schema for code generation:**
+
+```
+JSON Schema (what traditional tools use):
+{
+  "name": "list_errors",
+  "input_schema": {
+    "properties": {
+      "project": { "type": "string" },
+      "query": { "type": "string" }
+    }
+  }
+}
+→ The LLM must mentally translate this into a tool_use block
+
+TypeScript (what search_apis returns):
+sentry.listErrors(project: string, query?: string): Error[]
+→ The LLM can directly copy this into code
+```
+
+The TypeScript signature is literally the call syntax. There's no translation step. The LLM reads `sentry.listErrors(project: string)` and writes `sentry.listErrors("web-app")`. It's the same language.
+
+### Turn-by-Turn: The Raw Payloads
+
+Let's trace the exact JSON flowing back and forth. This mirrors the [multi-turn example from Layer 1](./tool-execution.md#a-complete-multi-turn-example-with-real-payloads), but for code mode.
+
+**User asks:** "Check for recent login crashes in our web app"
+
+#### Turn 1 → LLM Calls search_apis
+
+**Request** (your loop sends this):
+
+```json
+{
+  "model": "claude-sonnet-4-20250514",
+  "system": "You are a helpful coding assistant...",
+  "tools": [
+    { "name": "read", "..." : "..." },
+    { "name": "edit", "..." : "..." },
+    { "name": "search_apis", "..." : "..." },
+    { "name": "execute_code", "..." : "..." }
+  ],
+  "messages": [
+    { "role": "user", "content": "Check for recent login crashes in our web app" }
+  ]
+}
+```
+
+**Response** (the LLM returns this):
+
+```json
+{
+  "role": "assistant",
+  "content": [
+    {
+      "type": "text",
+      "text": "I'll search for error tracking methods to find login crashes."
+    },
+    {
+      "type": "tool_use",
+      "id": "toolu_01_search",
+      "name": "search_apis",
+      "input": {
+        "query": "list errors crashes by project"
+      }
+    }
+  ],
+  "stop_reason": "tool_use"
+}
+```
+
+Notice: the LLM **did not try to write code first**. It doesn't know what methods exist yet. It searched. This is the critical insight — the LLM uses `search_apis` the way a developer uses "Go to Definition" or searches API docs.
+
+**Your loop now:**
+1. Sees `stop_reason: "tool_use"` → continues looping.
+2. Extracts the `search_apis` call.
+3. Searches the internal TypeScript index (built when plugins connected).
+4. Finds matching methods from the Sentry plugin.
+5. Returns the matching TypeScript signatures as the tool result.
+
+#### Turn 1 Result → The LLM Sees TypeScript Signatures
+
+**Request** (messages now has 3 entries):
+
+```json
+{
+  "messages": [
+    {
+      "role": "user",
+      "content": "Check for recent login crashes in our web app"
+    },
+    {
+      "role": "assistant",
+      "content": [
+        { "type": "text", "text": "I'll search for error tracking methods to find login crashes." },
+        { "type": "tool_use", "id": "toolu_01_search", "name": "search_apis", "input": { "query": "list errors crashes by project" } }
+      ]
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "tool_result",
+          "tool_use_id": "toolu_01_search",
+          "content": "Found 2 matching methods:\n\n/** List errors for a project filtered by query */\nsentry.listErrors(project: string, query?: string): Error[]\n\n/** Get detailed error info including stack trace */\nsentry.getErrorDetail(errorId: string): ErrorDetail\n\ninterface Error {\n  id: string;\n  level: \"fatal\" | \"error\" | \"warning\";\n  message: string;\n  timestamp: string;\n}\n\ninterface ErrorDetail {\n  id: string;\n  message: string;\n  stacktrace: { file: string; line: number; function: string }[];\n  firstSeen: string;\n  lastSeen: string;\n  count: number;\n}"
+        }
+      ]
+    }
+  ]
+}
+```
+
+**This is the moment the LLM learns the API.** The tool result contains TypeScript signatures with full type information. The LLM now knows:
+- `sentry.listErrors` exists and takes a project name + optional query
+- `sentry.getErrorDetail` exists and takes an error ID
+- What the return types look like (fields, types, shapes)
+
+It has everything it needs to write correct code.
+
+#### Turn 2 → LLM Writes and Executes Code
+
+**Response** (the LLM returns this):
+
+```json
+{
+  "role": "assistant",
+  "content": [
+    {
+      "type": "text",
+      "text": "I found the Sentry error tracking API. Let me fetch recent login crashes and get the details."
+    },
+    {
+      "type": "tool_use",
+      "id": "toolu_02_exec",
+      "name": "execute_code",
+      "input": {
+        "code": "const errors = await sentry.listErrors(\"web-app\", \"login crash\");\nconst recent = errors.slice(0, 3);\nconst details = await Promise.all(\n  recent.map(e => sentry.getErrorDetail(e.id))\n);\nconsole.log(JSON.stringify(details.map(d => ({\n  message: d.message,\n  file: d.stacktrace[0]?.file,\n  line: d.stacktrace[0]?.line,\n  count: d.count,\n  lastSeen: d.lastSeen\n})), null, 2));"
+      }
+    }
+  ],
+  "stop_reason": "tool_use"
+}
+```
+
+**Look at what the LLM wrote.** This is real, idiomatic JavaScript:
+
+```javascript
+const errors = await sentry.listErrors("web-app", "login crash");
+const recent = errors.slice(0, 3);
+const details = await Promise.all(
+  recent.map(e => sentry.getErrorDetail(e.id))
+);
+console.log(JSON.stringify(details.map(d => ({
+  message: d.message,
+  file: d.stacktrace[0]?.file,
+  line: d.stacktrace[0]?.line,
+  count: d.count,
+  lastSeen: d.lastSeen
+})), null, 2));
+```
+
+The LLM knew to:
+- Call `sentry.listErrors` with the right arguments (from the signature)
+- Access `.id` on each error (from the `Error` interface)
+- Call `sentry.getErrorDetail` with the error ID (from the signature)
+- Access `.stacktrace[0].file` (from the `ErrorDetail` interface)
+- Use `console.log` (from the `execute_code` tool description saying "Use console.log() for output")
+- Use `await` and `Promise.all` (from its JavaScript training)
+
+**It made 4 API calls (1 list + 3 detail fetches) in 1 round trip.** With traditional tool calling, that's 4 separate turns through the loop.
+
+#### Turn 2 Result → Code Runs in Sandbox
+
+Your loop:
+1. Builds proxy objects for active plugins (`sentry` → routes to Sentry MCP).
+2. Creates a sandbox with `sentry` and `console` injected as globals.
+3. Runs the code. Each `sentry.*` call goes through the proxy to the real MCP server.
+4. Collects the `console.log` output.
+5. Returns it as the tool result.
+
+**Request** (messages now has 5 entries):
+
+```json
+{
+  "messages": [
+    { "role": "user", "content": "Check for recent login crashes in our web app" },
+    { "role": "assistant", "content": ["(search_apis call)"] },
+    { "role": "user", "content": ["(search_apis result — TypeScript signatures)"] },
+    { "role": "assistant", "content": ["(execute_code call)"] },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "tool_result",
+          "tool_use_id": "toolu_02_exec",
+          "content": "[\n  {\n    \"message\": \"Cannot read property 'token' of null\",\n    \"file\": \"src/auth/login.ts\",\n    \"line\": 42,\n    \"count\": 847,\n    \"lastSeen\": \"2025-01-15T10:23:00Z\"\n  },\n  {\n    \"message\": \"Session expired during login flow\",\n    \"file\": \"src/auth/session.ts\",\n    \"line\": 18,\n    \"count\": 234,\n    \"lastSeen\": \"2025-01-15T09:45:00Z\"\n  }\n]"
+        }
+      ]
+    }
+  ]
+}
+```
+
+#### Turn 3 → LLM Reports Results
+
+**Response:**
+
+```json
+{
+  "role": "assistant",
+  "content": [
+    {
+      "type": "text",
+      "text": "Found 2 recent login crashes:\n\n1. **`Cannot read property 'token' of null`** in `src/auth/login.ts:42` — 847 occurrences, last seen 30 minutes ago. This is a null reference error where the auth token is not being checked before access.\n\n2. **`Session expired during login flow`** in `src/auth/session.ts:18` — 234 occurrences. The session is expiring mid-login.\n\nThe first crash is the most frequent. Want me to read that file and fix it?"
+    }
+  ],
+  "stop_reason": "end_turn"
+}
+```
+
+`stop_reason: "end_turn"` — the loop exits and returns the text to the user.
+
+**The full flow took 2 round trips** (search + execute) for the plugin work, then the LLM reported results. With traditional tool calling, fetching errors + 2 detail lookups = 3 round trips minimum, plus the plugin activation step.
+
+### Comparing the Conversation Shape
+
+Here is the message array for the same task, side by side:
+
+```
+Code Mode (5 messages for the plugin work):
+messages[0]  user       → "Check for recent login crashes"
+messages[1]  assistant  → text + tool_use(search_apis)
+messages[2]  user       → tool_result (TypeScript signatures, ~200 tokens)
+messages[3]  assistant  → text + tool_use(execute_code)
+messages[4]  user       → tool_result (JSON output from code)
+messages[5]  assistant  → Final answer
+
+Traditional Tool Calling (9+ messages):
+messages[0]  user       → "Check for recent login crashes"
+messages[1]  assistant  → tool_use(activate_plugin "sentry")
+messages[2]  user       → tool_result ("activated, 10 tools loaded")
+                          ← TOOL LIST CHANGES: cache breakpoint 2 invalidated
+messages[3]  assistant  → tool_use(sentry_list_errors)
+messages[4]  user       → tool_result (error list)
+messages[5]  assistant  → tool_use(sentry_get_error_detail "E-123")
+messages[6]  user       → tool_result (error detail)
+messages[7]  assistant  → tool_use(sentry_get_error_detail "E-456")
+messages[8]  user       → tool_result (error detail)
+messages[9]  assistant  → Final answer
+```
+
+Code mode: **3 LLM calls**, 0 cache misses, ~260 tokens of plugin data in conversation.
+Traditional: **5 LLM calls**, 1 cache miss, ~2,500 tokens of plugin data in conversation.
+
+---
+
 ## How It Works
 
 ### Step 1: Generate a Searchable API Index
@@ -688,6 +1062,187 @@ sequenceDiagram
 ```
 
 Compare this to the [Progressive Discovery example](./progressive-discovery.md#full-example-progressive-discovery-in-action): same task, but code mode needed **2 round trips** for the Sentry work (search + execute) instead of **3** (activate + list + detail). More importantly: zero cache misses, zero full API dumps, and the LLM never needed to know the word "Sentry."
+
+---
+
+## Second Example: Cross-Plugin Query With an Error Recovery
+
+The first example showed the happy path. This example shows two things traditional tool-call examples often skip: **searching across multiple plugins** and **what happens when the LLM writes buggy code**.
+
+**User asks:** "How many users signed up this week, and what's the current design for the signup page?"
+
+This task spans two plugins (database and Figma) that the LLM doesn't need to know about by name.
+
+### Turn 1 → LLM Searches for Both Capabilities at Once
+
+```json
+{
+  "role": "assistant",
+  "content": [
+    {
+      "type": "text",
+      "text": "I'll search for methods to query user data and fetch design information."
+    },
+    {
+      "type": "tool_use",
+      "id": "toolu_01_search",
+      "name": "search_apis",
+      "input": {
+        "query": "query users signup count and get page design"
+      }
+    }
+  ],
+  "stop_reason": "tool_use"
+}
+```
+
+**Tool result** (the search matches across two different plugins):
+
+```
+Found 3 matching methods:
+
+/** Execute a SQL query against the database */
+db.query(sql: string, params?: any[]): Row[]
+
+/** Get the design spec for a page by name */
+figma.getDesign(pageName: string): DesignSpec
+
+interface Row {
+  [column: string]: any;
+}
+
+interface DesignSpec {
+  pageName: string;
+  components: { name: string; type: string; props: Record<string, any> }[];
+  lastUpdated: string;
+  figmaUrl: string;
+}
+```
+
+The LLM didn't ask for "the database plugin" or "the Figma plugin." It described what it needed, and the search found methods from both. Now it knows `db.query` and `figma.getDesign` exist.
+
+### Turn 2 → LLM Writes Code That Has a Bug
+
+```json
+{
+  "role": "assistant",
+  "content": [
+    {
+      "type": "tool_use",
+      "id": "toolu_02_exec",
+      "name": "execute_code",
+      "input": {
+        "code": "const users = await db.query(\n  \"SELECT COUNT(*) as count FROM users WHERE created_at > NOW() - INTERVAL '7 days'\"\n);\nconst design = await figma.getDesign(\"signup\");\nconsole.log(JSON.stringify({\n  signupsThisWeek: users[0].count,\n  design: design.components.map(c => c.name),\n  lastDesignUpdate: design.lastUpdated,\n  figmaLink: design.figmaUrl\n}));"
+      }
+    }
+  ],
+  "stop_reason": "tool_use"
+}
+```
+
+The code calls both plugins in one script. But the Figma page isn't called "signup" — it's called "Sign Up Page". The sandbox runs the code, and `figma.getDesign("signup")` returns `null`.
+
+**Tool result** (error from the sandbox):
+
+```
+TypeError: Cannot read properties of null (reading 'components')
+    at line 6
+```
+
+### Turn 3 → LLM Reads the Error and Retries
+
+This is the same pattern as [error handling in Layer 1](./tool-execution.md#error-handling-errors-are-just-data). The error becomes a tool result that the LLM reasons about:
+
+```json
+{
+  "role": "assistant",
+  "content": [
+    {
+      "type": "text",
+      "text": "The page name 'signup' wasn't found. Let me search for the correct page name."
+    },
+    {
+      "type": "tool_use",
+      "id": "toolu_03_search",
+      "name": "search_apis",
+      "input": {
+        "query": "list available design pages"
+      }
+    }
+  ],
+  "stop_reason": "tool_use"
+}
+```
+
+**Tool result:**
+
+```
+Found 1 matching method:
+
+/** List all page names in the Figma project */
+figma.listPages(): string[]
+```
+
+### Turn 4 → LLM Writes Corrected Code
+
+```json
+{
+  "role": "assistant",
+  "content": [
+    {
+      "type": "tool_use",
+      "id": "toolu_04_exec",
+      "name": "execute_code",
+      "input": {
+        "code": "const users = await db.query(\n  \"SELECT COUNT(*) as count FROM users WHERE created_at > NOW() - INTERVAL '7 days'\"\n);\nconst pages = await figma.listPages();\nconst signupPage = pages.find(p => p.toLowerCase().includes('sign'));\nconst design = signupPage ? await figma.getDesign(signupPage) : null;\nconsole.log(JSON.stringify({\n  signupsThisWeek: users[0].count,\n  matchedPage: signupPage,\n  design: design?.components.map(c => c.name) ?? 'Page not found',\n  lastDesignUpdate: design?.lastUpdated,\n  figmaLink: design?.figmaUrl\n}, null, 2));"
+      }
+    }
+  ],
+  "stop_reason": "tool_use"
+}
+```
+
+**Tool result:**
+
+```json
+{
+  "signupsThisWeek": 1847,
+  "matchedPage": "Sign Up Page",
+  "design": ["Header", "EmailInput", "PasswordInput", "SubmitButton", "SocialLogin"],
+  "lastDesignUpdate": "2025-01-14T16:30:00Z",
+  "figmaLink": "https://figma.com/file/abc123/Sign-Up-Page"
+}
+```
+
+### Turn 5 → LLM Reports Results
+
+```json
+{
+  "role": "assistant",
+  "content": [
+    {
+      "type": "text",
+      "text": "Here's what I found:\n\n**Signups this week:** 1,847 new users\n\n**Current signup page design** (last updated yesterday):\n- Header\n- Email input\n- Password input\n- Submit button\n- Social login (OAuth)\n\n[View in Figma](https://figma.com/file/abc123/Sign-Up-Page)"
+    }
+  ],
+  "stop_reason": "end_turn"
+}
+```
+
+### What This Example Demonstrates
+
+```mermaid
+flowchart TD
+    subgraph LESSONS ["Key Patterns"]
+        direction TB
+        L1["Cross-plugin: One search found\nmethods from db AND figma"]
+        L2["Error recovery: Sandbox error\nbecame a tool_result the LLM\nreasoned about and fixed"]
+        L3["Incremental discovery: LLM\nsearched twice — once for the\ninitial APIs, once when it\nneeded figma.listPages"]
+        L4["No plugin names needed:\nLLM never said 'database' or\n'Figma' — just described\nwhat it wanted"]
+    end
+```
+
+**Total: 3 round trips** (search → execute(error) → search → execute(success)), with 2 searches and 2 executions. With traditional tool calling, this would be: activate database plugin (cold turn) → query → activate Figma plugin (another cold turn) → getDesign(fail) → listPages → getDesign(success) = **6 round trips and 2 cache misses**.
 
 ---
 
