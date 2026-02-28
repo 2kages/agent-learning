@@ -16,6 +16,8 @@ const EVENT_COLORS: Record<TraceEvent['type'], string> = {
   context_pruned: '#f97316',
   context_compacted: '#f97316',
   observation: '#06b6d4',
+  sub_agent_spawned: '#a855f7',
+  sub_agent_completed: '#a855f7',
   error: '#ef4444',
 }
 
@@ -56,6 +58,12 @@ export function TraceEntry({ event, index }: TraceEntryProps) {
       break
     case 'observation':
       detail = `Observed: ${event.facts.join('; ').slice(0, 100)}`
+      break
+    case 'sub_agent_spawned':
+      detail = `Spawned: ${event.goal.slice(0, 80)}`
+      break
+    case 'sub_agent_completed':
+      detail = `Completed: ${event.output.slice(0, 80)}${event.isError ? ' (error)' : ''}`
       break
     case 'error':
       detail = event.message

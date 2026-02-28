@@ -75,6 +75,8 @@ export type TraceEvent =
   | { type: 'context_pruned'; pruned: number }
   | { type: 'context_compacted'; summary: string }
   | { type: 'observation'; facts: string[] }
+  | { type: 'sub_agent_spawned'; id: string; goal: string }
+  | { type: 'sub_agent_completed'; id: string; output: string; isError: boolean }
   | { type: 'error'; message: string }
 
 // ─── LLM Engine Interface ───────────────────────────────────────
