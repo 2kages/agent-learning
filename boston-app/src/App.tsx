@@ -5,23 +5,21 @@ import { TracePanel } from './ui/TracePanel'
 import { FileExplorer } from './ui/FileExplorer'
 import { useAgent } from './hooks/useAgent'
 import { useVirtualFS } from './hooks/useVirtualFS'
+import { useWebLLM } from './hooks/useWebLLM'
 import { MockLLMEngine } from './llm/mock-engine'
 import { ToolRegistry } from './agent/tool-registry'
 import { createFSTools } from './agent/tools/fs-tools'
 import type { LLMEngine } from './agent/types'
 import type { VirtualFS } from './fs/virtual-fs'
 
+const IS_MOCK = typeof window !== 'undefined' && new URL(window.location.href).searchParams.has('mock')
+
 /**
- * Creates the appropriate LLM engine based on URL params.
- * ?mock=true → MockLLMEngine (for tests and demos)
- * Otherwise → null (WebLLM loaded later)
+ * Creates a mock engine that echoes messages back (for tests).
  */
-function createEngine(): LLMEngine | null {
-  const isMock = new URL(window.location.href).searchParams.has('mock')
-  if (isMock) {
-    return new MockLLMEngine([]) as LLMEngine & { chat: MockLLMEngine['chat'] }
-  }
-  return null
+function createMockEngine(): LLMEngine {
+  // Mock engine that generates simple responses
+  return new MockLLMEngine([]) as LLMEngine
 }
 
 /**
@@ -39,19 +37,31 @@ function createToolRegistry(fs: VirtualFS): ToolRegistry {
  * 3-panel layout: Chat (left), Trace (center), Files (right).
  */
 export function App() {
-  const engine = useMemo(createEngine, [])
   const { fs, files } = useVirtualFS()
   const toolRegistry = useMemo(() => createToolRegistry(fs), [fs])
-  const { messages, traceEvents, isRunning, sendMessage } = useAgent(engine, toolRegistry)
+  const webLLM = useWebLLM()
+
+  // In mock mode, use MockEngine. Otherwise, use WebLLM engine (null until loaded).
+  const mockEngine = useMemo(() => IS_MOCK ? createMockEngine() : null, [])
+  const activeEngine = IS_MOCK ? mockEngine : webLLM.engine
+
+  const { messages, traceEvents, isRunning, sendMessage } = useAgent(activeEngine, toolRegistry)
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100vh', fontFamily: 'system-ui, sans-serif' }}>
       <header style={{ padding: '8px 16px', borderBottom: '1px solid #e0e0e0', display: 'flex', alignItems: 'center', gap: 12 }}>
         <h1 style={{ margin: 0, fontSize: 18 }}>Boston Agent</h1>
-        <ModelStatus />
+        <ModelStatus
+          status={webLLM.status}
+          progress={webLLM.progress}
+          statusText={webLLM.statusText}
+          error={webLLM.error}
+          isMock={IS_MOCK}
+          onLoad={webLLM.loadModel}
+        />
       </header>
       <main style={{ display: 'flex', flex: 1, overflow: 'hidden' }}>
-        <ChatPanel messages={messages} onSend={sendMessage} isRunning={isRunning} />
+        <ChatPanel messages={messages} onSend={sendMessage} isRunning={isRunning} engineReady={IS_MOCK || activeEngine !== null} />
         <TracePanel events={traceEvents} />
         <FileExplorer fs={fs} files={files} />
       </main>

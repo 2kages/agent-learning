@@ -75,7 +75,11 @@ export class WebLLMEngine implements LLMEngine {
     const response = await this.engine.chat.completions.create({
       messages: openaiMessages,
       temperature: 0.3,
-      response_format: { type: 'json_object', schema: RESPONSE_SCHEMA },
+      max_tokens: 1024,
+      response_format: {
+        type: 'json_object',
+        schema: JSON.stringify(RESPONSE_SCHEMA),
+      },
     })
 
     const raw = response.choices[0]?.message.content ?? '{}'
@@ -84,7 +88,11 @@ export class WebLLMEngine implements LLMEngine {
 
   /** Inject tool definitions into the system prompt as JSON */
   private buildSystemPrompt(base: string, tools: ToolDefinition[]): string {
-    if (tools.length === 0) return base
+    const jsonInstruction = 'You MUST respond with valid JSON: { "text": "your response" }'
+
+    if (tools.length === 0) {
+      return `${base}\n\n${jsonInstruction}`
+    }
 
     const toolDocs = tools.map(t => ({
       name: t.name,
@@ -98,8 +106,9 @@ export class WebLLMEngine implements LLMEngine {
 
 ${JSON.stringify(toolDocs, null, 2)}
 
-To call a tool, include it in your JSON response under "tool_calls".
-You may call multiple tools at once. If you don't need a tool, leave tool_calls empty or omit it.`
+${jsonInstruction}
+To call a tool, add "tool_calls": [{"name": "tool_name", "input": {...}}] to your JSON response.
+If you don't need a tool, omit tool_calls.`
   }
 
   /** Convert ContentBlock[] to plain text for the OpenAI message format */

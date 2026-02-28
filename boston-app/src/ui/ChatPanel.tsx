@@ -10,12 +10,13 @@ interface ChatPanelProps {
   messages: ChatMessage[]
   onSend: (text: string) => void
   isRunning: boolean
+  engineReady?: boolean
 }
 
 /**
  * Chat panel with message history and input form.
  */
-export function ChatPanel({ messages, onSend, isRunning }: ChatPanelProps) {
+export function ChatPanel({ messages, onSend, isRunning, engineReady = true }: ChatPanelProps) {
   const [input, setInput] = useState('')
   const bottomRef = useRef<HTMLDivElement>(null)
 
@@ -26,7 +27,7 @@ export function ChatPanel({ messages, onSend, isRunning }: ChatPanelProps) {
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault()
     const text = input.trim()
-    if (!text || isRunning) return
+    if (!text || isRunning || !engineReady) return
     setInput('')
     onSend(text)
   }
@@ -50,8 +51,8 @@ export function ChatPanel({ messages, onSend, isRunning }: ChatPanelProps) {
           type="text"
           value={input}
           onChange={e => setInput(e.target.value)}
-          placeholder="Type a message..."
-          disabled={isRunning}
+          placeholder={engineReady ? 'Type a message...' : 'Load model first...'}
+          disabled={isRunning || !engineReady}
           style={{
             flex: 1,
             padding: '8px 12px',
@@ -64,7 +65,7 @@ export function ChatPanel({ messages, onSend, isRunning }: ChatPanelProps) {
         <button
           data-testid="send-button"
           type="submit"
-          disabled={isRunning || !input.trim()}
+          disabled={isRunning || !input.trim() || !engineReady}
           style={{
             padding: '8px 16px',
             backgroundColor: '#2563eb',
@@ -72,8 +73,8 @@ export function ChatPanel({ messages, onSend, isRunning }: ChatPanelProps) {
             border: 'none',
             borderRadius: 8,
             fontSize: 14,
-            cursor: isRunning ? 'not-allowed' : 'pointer',
-            opacity: isRunning || !input.trim() ? 0.5 : 1,
+            cursor: isRunning || !engineReady ? 'not-allowed' : 'pointer',
+            opacity: isRunning || !input.trim() || !engineReady ? 0.5 : 1,
           }}
         >
           Send
