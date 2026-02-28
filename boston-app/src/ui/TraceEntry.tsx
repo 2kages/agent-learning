@@ -12,6 +12,7 @@ const EVENT_COLORS: Record<TraceEvent['type'], string> = {
   llm_response: '#3b82f6',
   tool_call: '#eab308',
   tool_result: '#22c55e',
+  skill_activated: '#8b5cf6',
   error: '#ef4444',
 }
 
@@ -40,6 +41,9 @@ export function TraceEntry({ event, index }: TraceEntryProps) {
       break
     case 'tool_result':
       detail = `Result: ${event.output.slice(0, 100)}${event.output.length > 100 ? '...' : ''}`
+      break
+    case 'skill_activated':
+      detail = `Skill: ${event.name}`
       break
     case 'error':
       detail = event.message
