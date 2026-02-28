@@ -72,6 +72,8 @@ export type TraceEvent =
   | { type: 'tool_call'; name: string; input: Record<string, unknown> }
   | { type: 'tool_result'; name: string; output: string; isError: boolean }
   | { type: 'skill_activated'; name: string }
+  | { type: 'context_pruned'; pruned: number }
+  | { type: 'context_compacted'; summary: string }
   | { type: 'error'; message: string }
 
 // ─── LLM Engine Interface ───────────────────────────────────────

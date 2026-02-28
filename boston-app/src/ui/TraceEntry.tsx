@@ -13,6 +13,8 @@ const EVENT_COLORS: Record<TraceEvent['type'], string> = {
   tool_call: '#eab308',
   tool_result: '#22c55e',
   skill_activated: '#8b5cf6',
+  context_pruned: '#f97316',
+  context_compacted: '#f97316',
   error: '#ef4444',
 }
 
@@ -44,6 +46,12 @@ export function TraceEntry({ event, index }: TraceEntryProps) {
       break
     case 'skill_activated':
       detail = `Skill: ${event.name}`
+      break
+    case 'context_pruned':
+      detail = `Pruned ${event.pruned} old tool results`
+      break
+    case 'context_compacted':
+      detail = `Compacted: ${event.summary.slice(0, 80)}...`
       break
     case 'error':
       detail = event.message
