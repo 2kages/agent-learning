@@ -25,7 +25,7 @@ export class MockLLMEngine implements LLMEngine {
     systemPrompt: string,
     tools: ToolDefinition[]
   ): Promise<LLMResponse> {
-    this.calls.push({ messages, systemPrompt, tools })
+    this.calls.push({ messages: [...messages], systemPrompt, tools: [...tools] })
 
     if (this.index >= this.responses.length) {
       return {
