@@ -2,9 +2,14 @@ import { useMemo } from 'react'
 import { ModelStatus } from './ui/ModelStatus'
 import { ChatPanel } from './ui/ChatPanel'
 import { TracePanel } from './ui/TracePanel'
+import { FileExplorer } from './ui/FileExplorer'
 import { useAgent } from './hooks/useAgent'
+import { useVirtualFS } from './hooks/useVirtualFS'
 import { MockLLMEngine } from './llm/mock-engine'
+import { ToolRegistry } from './agent/tool-registry'
+import { createFSTools } from './agent/tools/fs-tools'
 import type { LLMEngine } from './agent/types'
+import type { VirtualFS } from './fs/virtual-fs'
 
 /**
  * Creates the appropriate LLM engine based on URL params.
@@ -14,19 +19,30 @@ import type { LLMEngine } from './agent/types'
 function createEngine(): LLMEngine | null {
   const isMock = new URL(window.location.href).searchParams.has('mock')
   if (isMock) {
-    // Mock engine with a simple echo response for demo/testing
     return new MockLLMEngine([]) as LLMEngine & { chat: MockLLMEngine['chat'] }
   }
   return null
 }
 
 /**
+ * Creates and populates a tool registry with VirtualFS tools.
+ */
+function createToolRegistry(fs: VirtualFS): ToolRegistry {
+  const registry = new ToolRegistry()
+  for (const tool of createFSTools(fs)) {
+    registry.register(tool)
+  }
+  return registry
+}
+
+/**
  * 3-panel layout: Chat (left), Trace (center), Files (right).
- * Panels are progressively filled in by each layer commit.
  */
 export function App() {
   const engine = useMemo(createEngine, [])
-  const { messages, traceEvents, isRunning, sendMessage } = useAgent(engine)
+  const { fs, files } = useVirtualFS()
+  const toolRegistry = useMemo(() => createToolRegistry(fs), [fs])
+  const { messages, traceEvents, isRunning, sendMessage } = useAgent(engine, toolRegistry)
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100vh', fontFamily: 'system-ui, sans-serif' }}>
@@ -37,9 +53,7 @@ export function App() {
       <main style={{ display: 'flex', flex: 1, overflow: 'hidden' }}>
         <ChatPanel messages={messages} onSend={sendMessage} isRunning={isRunning} />
         <TracePanel events={traceEvents} />
-        <section data-testid="file-panel" style={{ flex: 1, padding: 16, overflow: 'auto' }}>
-          <p style={{ color: '#888' }}>File explorer — Layer 1</p>
-        </section>
+        <FileExplorer fs={fs} files={files} />
       </main>
     </div>
   )

@@ -6,13 +6,17 @@ import type {
   TraceEvent,
   ContentBlock,
   TextBlock,
+  ToolUseBlock,
+  ToolResultBlock,
 } from './types'
+import type { ToolRegistry } from './tool-registry'
 import { MAX_AGENT_TURNS, SYSTEM_PROMPT } from '../lib/constants'
 
 export interface AgentLoopOptions {
   engine: LLMEngine
   systemPrompt?: string
   tools?: ToolDefinition[]
+  toolRegistry?: ToolRegistry
   maxTurns?: number
 }
 
@@ -24,8 +28,6 @@ export interface AgentLoopOptions {
  * 2. Check stop_reason
  * 3. If tool_use → execute tools, push results, loop
  * 4. If end_turn → return final text
- *
- * Layer 0: no tools yet, just the basic loop that exits on end_turn.
  */
 export async function* runAgentLoop(
   userMessage: string,
@@ -35,6 +37,7 @@ export async function* runAgentLoop(
     engine,
     systemPrompt = SYSTEM_PROMPT,
     tools = [],
+    toolRegistry,
     maxTurns = MAX_AGENT_TURNS,
   } = options
 
@@ -61,10 +64,36 @@ export async function* runAgentLoop(
       break
     }
 
-    // Layer 1+ will handle tool execution here.
-    // For now, if stop_reason is tool_use but we have no tool executor,
-    // just break to avoid infinite loop.
-    break
+    // No registry → can't execute tools, bail
+    if (!toolRegistry) {
+      break
+    }
+
+    // Extract tool_use blocks
+    const toolCalls = lastResponse.content.filter(
+      (b: ContentBlock): b is ToolUseBlock => b.type === 'tool_use'
+    )
+
+    // Execute each tool and collect results
+    const toolResults: ToolResultBlock[] = []
+
+    for (const call of toolCalls) {
+      yield { type: 'tool_call', name: call.name, input: call.input }
+
+      const result = await toolRegistry.execute(call.name, call.input)
+
+      yield { type: 'tool_result', name: call.name, output: result.output, isError: result.isError }
+
+      toolResults.push({
+        type: 'tool_result',
+        tool_use_id: call.id,
+        content: result.output,
+        is_error: result.isError,
+      })
+    }
+
+    // Push tool results as a user message (Anthropic API convention)
+    messages.push({ role: 'user', content: toolResults })
   }
 
   yield { type: 'loop_end' }
