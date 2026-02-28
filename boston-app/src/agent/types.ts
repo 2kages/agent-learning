@@ -74,6 +74,7 @@ export type TraceEvent =
   | { type: 'skill_activated'; name: string }
   | { type: 'context_pruned'; pruned: number }
   | { type: 'context_compacted'; summary: string }
+  | { type: 'observation'; facts: string[] }
   | { type: 'error'; message: string }
 
 // ─── LLM Engine Interface ───────────────────────────────────────

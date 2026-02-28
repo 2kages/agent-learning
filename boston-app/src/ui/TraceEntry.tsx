@@ -15,6 +15,7 @@ const EVENT_COLORS: Record<TraceEvent['type'], string> = {
   skill_activated: '#8b5cf6',
   context_pruned: '#f97316',
   context_compacted: '#f97316',
+  observation: '#06b6d4',
   error: '#ef4444',
 }
 
@@ -52,6 +53,9 @@ export function TraceEntry({ event, index }: TraceEntryProps) {
       break
     case 'context_compacted':
       detail = `Compacted: ${event.summary.slice(0, 80)}...`
+      break
+    case 'observation':
+      detail = `Observed: ${event.facts.join('; ').slice(0, 100)}`
       break
     case 'error':
       detail = event.message
